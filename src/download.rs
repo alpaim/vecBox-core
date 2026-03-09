@@ -101,3 +101,26 @@ pub fn download_model(repo_id: &str, quant: &str) -> anyhow::Result<DownloadedMo
         config_dir,
     })
 }
+
+pub fn fetch_available_quants(repo_id: &str) -> anyhow::Result<Vec<String>> {
+    let api = ApiBuilder::new().with_progress(false).build()?;
+    let repo = api.model(repo_id.to_string());
+    let info = repo.info()?;
+    let quants: Vec<String> = info
+        .siblings
+        .iter()
+        .filter_map(|f| {
+            let name = &f.rfilename;
+            if name.ends_with(".gguf") && !name.contains("mmproj") {
+                name.strip_suffix(".gguf").map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(if quants.is_empty() {
+        vec!["Q4_K_M".to_string()]
+    } else {
+        quants
+    })
+}
