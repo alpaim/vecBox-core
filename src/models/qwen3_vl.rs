@@ -4,7 +4,7 @@
 use std::f64;
 
 #[cfg(feature = "cuda-flash-attn")]
-use candle_flash_attn::flash_attn;
+use candle_flash_attn::{flash_attn, flash_attn_varlen};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{
@@ -269,6 +269,22 @@ fn flash_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
     out.transpose(1, 2)?.contiguous()
 }
 
+#[cfg(feature = "cuda-flash-attn")]
+fn flash_attention_varlen_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens: &Tensor,
+    max_seqlen: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let (total_tokens, num_heads, head_dim) = q.dims3()?;
+    let _ = (total_tokens, head_dim);
+    flash_attn_varlen(
+        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, scale, false,
+    )
+}
+
 fn attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
     #[cfg(feature = "cuda-flash-attn")]
     {
@@ -277,6 +293,56 @@ fn attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<T
         }
     }
     eager_attention_forward(q, k, v, scale)
+}
+
+fn attention_forward_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens: &Tensor,
+    max_seqlen: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda-flash-attn")]
+    {
+        if q.device().is_cuda() {
+            return flash_attention_varlen_forward(q, k, v, cu_seqlens, max_seqlen, scale);
+        }
+    }
+    eager_attention_forward_varlen(q, k, v, cu_seqlens, scale)
+}
+
+fn eager_attention_forward_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let cu_seqlens_vec = cu_seqlens.to_vec1::<u32>()?;
+    let mut outputs = Vec::new();
+
+    for window in cu_seqlens_vec.windows(2) {
+        let start = window[0] as usize;
+        let end = window[1] as usize;
+        if end <= start {
+            continue;
+        }
+
+        let q_chunk = q.narrow(0, start, end - start)?;
+        let k_chunk = k.narrow(0, start, end - start)?;
+        let v_chunk = v.narrow(0, start, end - start)?;
+
+        let (num_heads, chunk_len, head_dim) = q_chunk.dims3()?;
+        let q_4d = q_chunk.unsqueeze(0)?.contiguous()?;
+        let k_4d = k_chunk.unsqueeze(0)?.contiguous()?;
+        let v_4d = v_chunk.unsqueeze(0)?.contiguous()?;
+
+        let chunk_out = eager_attention_forward(&q_4d, &k_4d, &v_4d, scale)?;
+        outputs.push(chunk_out.squeeze(0)?);
+    }
+
+    Tensor::cat(&outputs, 1)
 }
 
 struct VisionAttention {
@@ -299,7 +365,7 @@ impl VisionAttention {
     fn forward(
         &self,
         xs: &Tensor,
-        cu_seqlens: &[usize],
+        cu_seqlens: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
@@ -319,14 +385,51 @@ impl VisionAttention {
         let (q_rot, k_rot) = apply_rotary_pos_emb_vision(&q_f32, &k_f32, &cos, &sin)?;
         let q = q_rot.to_dtype(xs.dtype())?;
         let k = k_rot.to_dtype(xs.dtype())?;
-        // v stays in original dtype (F16/BF16) - no precision-sensitive operations
 
         let scale = (self.head_dim as f32).powf(-0.5);
 
+        let cu_seqlens_vec = cu_seqlens.to_vec1::<u32>()?;
+        let max_seqlen = cu_seqlens_vec
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .unwrap_or(0);
+
+        let attn_output = if xs.device().is_cuda() {
+            #[cfg(feature = "cuda-flash-attn")]
+            {
+                let q_3d = q.transpose(0, 1)?.contiguous()?;
+                let k_3d = k.transpose(0, 1)?.contiguous()?;
+                let v_3d = v.transpose(0, 1)?.contiguous()?;
+                let out = flash_attention_varlen_forward(
+                    &q_3d, &k_3d, &v_3d, cu_seqlens, max_seqlen, scale,
+                )?;
+                out.transpose(0, 1)?.contiguous()?
+            }
+            #[cfg(not(feature = "cuda-flash-attn"))]
+            {
+                self.eager_attention_loop(&q, &k, &v, &cu_seqlens_vec, scale)?
+            }
+        } else {
+            self.eager_attention_loop(&q, &k, &v, &cu_seqlens_vec, scale)?
+        };
+
+        let attn_output = attn_output.reshape((seq_len, self.num_heads * self.head_dim))?;
+        self.proj.forward(&attn_output)
+    }
+
+    fn eager_attention_loop(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        cu_seqlens: &[u32],
+        scale: f32,
+    ) -> Result<Tensor> {
         let mut outputs = Vec::new();
         for window in cu_seqlens.windows(2) {
-            let start = window[0];
-            let end = window[1];
+            let start = window[0] as usize;
+            let end = window[1] as usize;
             if end <= start {
                 continue;
             }
@@ -343,11 +446,9 @@ impl VisionAttention {
             let chunk_out = attention_forward(&q_chunk, &k_chunk, &v_chunk, scale)?;
 
             let chunk_out = chunk_out.squeeze(0)?.transpose(0, 1)?;
-            let chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
             outputs.push(chunk_out);
         }
-        let attn_output = Tensor::cat(&outputs, 0)?.to_dtype(xs.dtype())?;
-        self.proj.forward(&attn_output)
+        Tensor::cat(&outputs, 0)
     }
 }
 
@@ -384,7 +485,7 @@ impl VisionBlock {
     fn forward(
         &self,
         xs: &Tensor,
-        cu_seqlens: &[usize],
+        cu_seqlens: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
@@ -719,22 +820,24 @@ impl Qwen3VLVisionModel {
             .reshape((total_tokens, freq_table.dim(D::Minus1)? * 2))
     }
 
-    fn build_cu_seqlens(&self, grid_thw: &Tensor) -> Result<Vec<usize>> {
+    fn build_cu_seqlens(&self, grid_thw: &Tensor, device: &Device) -> Result<Tensor> {
         let grid = grid_thw.to_vec2::<u32>()?;
-        let mut cu = Vec::with_capacity(grid.iter().map(|v| v[0] as usize).sum::<usize>() + 1);
-        cu.push(0usize);
-        let mut acc = 0usize;
+        let num_sequences: usize = grid.iter().map(|v| v[0] as usize).sum();
+        let mut cu = Vec::with_capacity(num_sequences + 1);
+        cu.push(0u32);
+        let mut acc = 0u32;
         for g in &grid {
-            let area = (g[1] * g[2]) as usize;
-            for _ in 0..(g[0] as usize) {
+            let area = g[1] * g[2];
+            for _ in 0..g[0] {
                 acc += area;
                 cu.push(acc);
             }
         }
-        Ok(cu)
+        Tensor::from_vec(cu, (num_sequences + 1,), device)
     }
 
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let device = self.pos_embed.embeddings().device();
         let dtype = self.pos_embed.embeddings().dtype();
         let xs = self.patch_embed.forward(&xs.to_dtype(dtype)?)?;
         let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?;
@@ -747,7 +850,7 @@ impl Qwen3VLVisionModel {
         let cos = emb.cos()?.to_dtype(DType::F32)?;
         let sin = emb.sin()?.to_dtype(DType::F32)?;
 
-        let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
+        let cu_seqlens = self.build_cu_seqlens(grid_thw, device)?;
 
         let mut deepstack_features = Vec::new();
         for (layer_idx, block) in self.blocks.iter().enumerate() {
