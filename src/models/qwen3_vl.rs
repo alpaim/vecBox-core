@@ -291,10 +291,11 @@ impl VisionAttention {
 
         let cos = cos.to_dtype(DType::F32)?;
         let sin = sin.to_dtype(DType::F32)?;
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let (q, k) = apply_rotary_pos_emb_vision(&q, &k, &cos, &sin)?;
+        let q_f32 = q.to_dtype(DType::F32)?;
+        let k_f32 = k.to_dtype(DType::F32)?;
+        let (q_rot, k_rot) = apply_rotary_pos_emb_vision(&q_f32, &k_f32, &cos, &sin)?;
+        let q = q_rot.to_dtype(xs.dtype())?;
+        let k = k_rot.to_dtype(xs.dtype())?;
 
         let scale = (self.head_dim as f32).powf(-0.5);
 
