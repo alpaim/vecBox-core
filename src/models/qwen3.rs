@@ -7,6 +7,9 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+#[cfg(feature = "cuda")]
+use candle_flash_attn::flash_attn;
+
 use candle_core::quantized::{gguf_file, QMatMul};
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
@@ -1004,6 +1007,51 @@ fn eager_attention_forward(
     attn_weights.matmul(v)
 }
 
+#[cfg(feature = "cuda")]
+fn flash_attention_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    attention_mask: Option<&Tensor>,
+    scaling: f32,
+) -> Result<Tensor> {
+    let (b, num_heads, seq_len, head_dim) = q.dims4()?;
+    let q = q.transpose(1, 2)?.contiguous()?;
+    let k = k.transpose(1, 2)?.contiguous()?;
+    let v = v.transpose(1, 2)?.contiguous()?;
+    let causal = attention_mask.is_some();
+    let out = flash_attn(&q, &k, &v, scaling, causal)?;
+    out.transpose(1, 2)?.contiguous()
+}
+
+fn attention_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    attention_mask: Option<&Tensor>,
+    scaling: f32,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if q.device().is_cuda() {
+            return flash_attention_forward(q, k, v, attention_mask, scaling);
+        }
+    }
+    if q.device().is_metal() {
+        let (b, num_heads, seq_len, _head_dim) = q.dims4()?;
+        let mask = attention_mask
+            .map(|m| m.broadcast_as((b, num_heads, seq_len, seq_len)))
+            .transpose()?;
+        candle_nn::ops::sdpa(q, k, v, mask.as_ref(), false, scaling, 1.0)
+    } else {
+        let (b, num_heads, seq_len, _head_dim) = q.dims4()?;
+        let mask = attention_mask
+            .map(|m| m.broadcast_as((b, num_heads, seq_len, seq_len)))
+            .transpose()?;
+        eager_attention_forward(q, k, v, mask.as_ref(), scaling)
+    }
+}
+
 // - q_norm/k_norm on head_dim after reshape
 // - RoPE on q,k
 // - repeat_kv for key/value (GQA)
@@ -1114,25 +1162,10 @@ impl Qwen3Attention {
         let k = repeat_kv(&k, self.num_kv_groups)?;
         let v = repeat_kv(&v, self.num_kv_groups)?;
 
-        // Use SDPA for Metal only, eager attention for CPU/CUDA
-        // Note: candle_nn::ops::sdpa is Metal-only, not available for CUDA
-        let is_metal = q.device().is_metal();
-        let out = if is_metal {
-            let mask = if let Some(mask) = attention_mask {
-                Some(mask.broadcast_as((b, self.num_heads, t, t))?)
-            } else {
-                None
-            };
-            candle_nn::ops::sdpa(&q, &k, &v, mask.as_ref(), false, self.scaling, 1.0)?
-        } else {
-            // Use eager attention for CPU and CUDA (SDPA is Metal-only in Candle)
-            let mask = if let Some(mask) = attention_mask {
-                Some(mask.broadcast_as((b, self.num_heads, t, t))?)
-            } else {
-                None
-            };
-            eager_attention_forward(&q, &k, &v, mask.as_ref(), self.scaling)?
-        };
+        let mask = attention_mask
+            .map(|m| m.broadcast_as((b, self.num_heads, t, t)))
+            .transpose()?;
+        let out = attention_forward(&q, &k, &v, mask.as_ref(), self.scaling)?;
 
         // transpose back -> [B,T,Nh,D] -> reshape [B,T,Nh*D] -> o_proj -> [B,T,H]
         let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * d))?;

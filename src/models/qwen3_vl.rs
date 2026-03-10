@@ -3,6 +3,9 @@
 
 use std::f64;
 
+#[cfg(feature = "cuda")]
+use candle_flash_attn::flash_attn;
+
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{
     embedding, layer_norm, linear, Activation, Embedding, LayerNorm, LayerNormConfig, Linear,
@@ -252,8 +255,28 @@ fn eager_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
     let scale_tensor = Tensor::new(scale, q.device())?.to_dtype(q.dtype())?;
     let attn_weights = attn_weights.broadcast_mul(&scale_tensor)?;
     let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
-        .to_dtype(attn_weights.dtype())?;
+        .to_dtype(q.dtype())?;
     attn_weights.matmul(v)
+}
+
+#[cfg(feature = "cuda")]
+fn flash_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    let (batch, num_heads, seq_len, head_dim) = q.dims4()?;
+    let q = q.transpose(1, 2)?.contiguous()?;
+    let k = k.transpose(1, 2)?.contiguous()?;
+    let v = v.transpose(1, 2)?.contiguous()?;
+    let out = flash_attn(&q, &k, &v, scale, false)?;
+    out.transpose(1, 2)?.contiguous()
+}
+
+fn attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if q.device().is_cuda() {
+            return flash_attention_forward(q, k, v, scale);
+        }
+    }
+    eager_attention_forward(q, k, v, scale)
 }
 
 struct VisionAttention {
@@ -291,10 +314,12 @@ impl VisionAttention {
 
         let cos = cos.to_dtype(DType::F32)?;
         let sin = sin.to_dtype(DType::F32)?;
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let (q, k) = apply_rotary_pos_emb_vision(&q, &k, &cos, &sin)?;
+        let q_f32 = q.to_dtype(DType::F32)?;
+        let k_f32 = k.to_dtype(DType::F32)?;
+        let (q_rot, k_rot) = apply_rotary_pos_emb_vision(&q_f32, &k_f32, &cos, &sin)?;
+        let q = q_rot.to_dtype(xs.dtype())?;
+        let k = k_rot.to_dtype(xs.dtype())?;
+        // v stays in original dtype (F16/BF16) - no precision-sensitive operations
 
         let scale = (self.head_dim as f32).powf(-0.5);
 
@@ -315,7 +340,7 @@ impl VisionAttention {
             let k_chunk = k_chunk.unsqueeze(0)?;
             let v_chunk = v_chunk.unsqueeze(0)?;
 
-            let chunk_out = eager_attention_forward(&q_chunk, &k_chunk, &v_chunk, scale)?;
+            let chunk_out = attention_forward(&q_chunk, &k_chunk, &v_chunk, scale)?;
 
             let chunk_out = chunk_out.squeeze(0)?.transpose(0, 1)?;
             let chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
