@@ -3,7 +3,7 @@
 
 use std::f64;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-flash-attn")]
 use candle_flash_attn::flash_attn;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
@@ -259,7 +259,7 @@ fn eager_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
     attn_weights.matmul(v)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-flash-attn")]
 fn flash_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
     let (batch, num_heads, seq_len, head_dim) = q.dims4()?;
     let q = q.transpose(1, 2)?.contiguous()?;
@@ -270,7 +270,7 @@ fn flash_attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
 }
 
 fn attention_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-flash-attn")]
     {
         if q.device().is_cuda() {
             return flash_attention_forward(q, k, v, scale);

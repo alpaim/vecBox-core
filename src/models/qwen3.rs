@@ -7,7 +7,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-flash-attn")]
 use candle_flash_attn::flash_attn;
 
 use candle_core::quantized::{gguf_file, QMatMul};
@@ -1007,7 +1007,7 @@ fn eager_attention_forward(
     attn_weights.matmul(v)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-flash-attn")]
 fn flash_attention_forward(
     q: &Tensor,
     k: &Tensor,
@@ -1031,7 +1031,7 @@ fn attention_forward(
     attention_mask: Option<&Tensor>,
     scaling: f32,
 ) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-flash-attn")]
     {
         if q.device().is_cuda() {
             return flash_attention_forward(q, k, v, attention_mask, scaling);
