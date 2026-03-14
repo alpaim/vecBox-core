@@ -348,7 +348,8 @@ fn preprocess_image(img: &DynamicImage, cfg: &Qwen3VLPreprocessorConfig) -> Resu
         &rgb,
         resized_w as u32,
         resized_h as u32,
-        FilterType::Triangle,
+        // Same to PIL BICUBIC;
+        FilterType::CatmullRom, // preprocessor_config has '"resample": 3' which is PIL BICUBIC
     );
 
     let scale = [
@@ -484,7 +485,7 @@ fn preprocess_video(
                 &rgb,
                 resized_w as u32,
                 resized_h as u32,
-                FilterType::Triangle,
+                FilterType::CatmullRom,
             );
             resized
         })
